@@ -1,27 +1,40 @@
 import { Octokit } from "@octokit/rest";
-import { Env, PluginInputs } from "./types";
+import { PluginInputs } from "./types";
 import { Context } from "./types";
-import { isIssueCommentEvent } from "./types/typeguards";
-import { helloWorld } from "./handlers/hello-world";
 import { LogLevel, Logs } from "@ubiquity-dao/ubiquibot-logger";
+import { handleExperienceChecks } from "./handlers/handle-xp-check";
+import manifest from "../manifest.json";
 
-/**
- * The main plugin function. Split for easier testing.
- */
-export async function runPlugin(context: Context) {
+export async function runPlugin(context: Context, token: string) {
   const { logger, eventName } = context;
 
-  if (isIssueCommentEvent(context)) {
-    return await helloWorld(context);
-  }
+  if (eventName === "issues.assigned") {
+    const result: Record<string, boolean> = await handleExperienceChecks(context, token);
 
-  logger.error(`Unsupported event: ${eventName}`);
+    for (const [user, isOk] of Object.entries(result)) {
+      if (!isOk) {
+        logger.info(`${user} failed the experience check, removing...`);
+        try {
+          await context.octokit.rest.issues.removeAssignees({
+            owner: context.payload.repository.owner.login,
+            repo: context.payload.repository.name,
+            issue_number: context.payload.issue.number,
+            assignees: [user],
+          });
+        } catch (e) {
+          logger.error(`Failed to remove ${user} from issue`, { e });
+        }
+      }
+    }
+  } else {
+    throw logger.error(`Unsupported event: ${eventName}`).logMessage.raw;
+  }
 }
 
 /**
  * How a worker executes the plugin.
  */
-export async function plugin(inputs: PluginInputs, env: Env) {
+export async function plugin(inputs: PluginInputs) {
   const octokit = new Octokit({ auth: inputs.authToken });
 
   const context: Context = {
@@ -29,20 +42,23 @@ export async function plugin(inputs: PluginInputs, env: Env) {
     payload: inputs.eventPayload,
     config: inputs.settings,
     octokit,
-    env,
     logger: new Logs("info" as LogLevel),
   };
 
-  /**
-   * NOTICE: Consider non-database storage solutions unless necessary
-   *
-   * Initialize storage adapters here. For example, to use Supabase:
-   *
-   * import { createClient } from "@supabase/supabase-js";
-   *
-   * const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_KEY);
-   * context.adapters = createAdapters(supabase, context);
-   */
+  await runPlugin(context, inputs.authToken);
+  await returnDataToKernel(context, inputs.stateId, {});
+}
 
-  return runPlugin(context);
+async function returnDataToKernel(context: Context, stateId: string, output: object) {
+  const { octokit, payload } = context;
+  await octokit.repos.createDispatchEvent({
+    owner: payload.repository.owner.login,
+    repo: payload.repository.name,
+    event_type: "return_data_to_ubiquibot_kernel",
+    client_payload: {
+      pluginName: manifest.name,
+      state_id: stateId,
+      output: JSON.stringify(output),
+    },
+  });
 }
